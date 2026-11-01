@@ -102,6 +102,8 @@ int PT_DECLSPEC sndDevicesInit(PT_HANDLE *hp_sndDevices, CSlout *hp_slout, int i
     cast_handle->pAudioClientPlaybackRender = NULL;
 	cast_handle->pEndptVolCapture = NULL;
 	cast_handle->pEndptVolPlayback  = NULL;
+	cast_handle->playbackIsExclusive = FALSE;
+	cast_handle->exclusiveSampleType = SND_DEVICES_EXCL_FMT_FLOAT32;
 	cast_handle->ignoreVolumeCallbacks = FALSE;
 	cast_handle->ignoreDeviceCallbacks = FALSE;
 

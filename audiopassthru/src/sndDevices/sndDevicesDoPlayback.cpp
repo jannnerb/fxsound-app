@@ -36,6 +36,83 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "u_sndDevices.h"
 #include "sndDevices.h"
 
+/* Float sample, nominal range -1.0 to 1.0, to a clipped 32 bit signed integer sample. */
+static INT32 sndDevicesFloatToInt32(float f)
+{
+	double d = (double)f * 2147483648.0;
+
+	if( d != d )
+		return( 0 );	// NaN
+	if( d >= 2147483647.0 )
+		return( 2147483647 );
+	if( d <= -2147483648.0 )
+		return( (INT32)(-2147483647 - 1) );
+	return( (INT32)d );
+}
+
+/*
+ * Converts float samples to the sample format of an exclusive-mode output stream and writes them to pDest.
+ * numSamples is the number of samples, ie frames * channels.
+ */
+static void sndDevicesWriteExclusiveSamples(BYTE *pDest, const float *fpSrc, UINT32 numSamples, int sampleType)
+{
+	UINT32 i;
+	INT32 v;
+	double d;
+
+	switch( sampleType )
+	{
+		case SND_DEVICES_EXCL_FMT_INT32:
+		{
+			INT32 *p32 = (INT32 *)pDest;
+			for(i=0; i<numSamples; i++)
+				p32[i] = sndDevicesFloatToInt32(fpSrc[i]);
+			break;
+		}
+		case SND_DEVICES_EXCL_FMT_INT24_IN_32:
+		{
+			INT32 *p32 = (INT32 *)pDest;
+			for(i=0; i<numSamples; i++)
+				p32[i] = (INT32)((UINT32)sndDevicesFloatToInt32(fpSrc[i]) & 0xFFFFFF00u);
+			break;
+		}
+		case SND_DEVICES_EXCL_FMT_INT24_PACKED:
+		{
+			for(i=0; i<numSamples; i++)
+			{
+				v = sndDevicesFloatToInt32(fpSrc[i]) >> 8;
+				pDest[i*3]     = (BYTE)(v & 0xFF);
+				pDest[i*3 + 1] = (BYTE)((v >> 8) & 0xFF);
+				pDest[i*3 + 2] = (BYTE)((v >> 16) & 0xFF);
+			}
+			break;
+		}
+		case SND_DEVICES_EXCL_FMT_INT16:
+		{
+			INT16 *p16 = (INT16 *)pDest;
+			for(i=0; i<numSamples; i++)
+			{
+				d = floor((double)fpSrc[i] * 32768.0 + 0.5);
+				if( d != d )
+					d = 0.0;
+				if( d > 32767.0 )
+					d = 32767.0;
+				if( d < -32768.0 )
+					d = -32768.0;
+				p16[i] = (INT16)d;
+			}
+			break;
+		}
+		default:	// SND_DEVICES_EXCL_FMT_FLOAT32
+		{
+			float *pf = (float *)pDest;
+			for(i=0; i<numSamples; i++)
+				pf[i] = fpSrc[i];
+			break;
+		}
+	}
+}
+
 /*
  * FUNCTION: sndDevicesDoPlayback()
  * DESCRIPTION: Plays back audio buffers to specified playback device.
@@ -109,10 +186,19 @@ int PT_DECLSPEC sndDevicesDoPlayback(PT_HANDLE *hp_sndDevices, int *ip_resultFla
 		if( (cast_handle->pDataPacketPlayback != NULL) && (cast_handle->fPlaybackBuf != NULL) )
 		{
 			loopsize = cast_handle->playbackFrameCount * numPlaybackChannels;
-			fptr = (float *)(cast_handle->pDataPacketPlayback);
 
-			for(i=0; i<loopsize; i++)
-				fptr[i] = cast_handle->fPlaybackBuf[i];
+			if( cast_handle->playbackIsExclusive )
+			{
+				// Exclusive-mode stream, the device wants its own sample format.
+				sndDevicesWriteExclusiveSamples(cast_handle->pDataPacketPlayback, cast_handle->fPlaybackBuf, loopsize, cast_handle->exclusiveSampleType);
+			}
+			else
+			{
+				fptr = (float *)(cast_handle->pDataPacketPlayback);
+
+				for(i=0; i<loopsize; i++)
+					fptr[i] = cast_handle->fPlaybackBuf[i];
+			}
 		}
 
 		hr = cast_handle->pAudioClientPlaybackRender->ReleaseBuffer(cast_handle->playbackFrameCount, flags);

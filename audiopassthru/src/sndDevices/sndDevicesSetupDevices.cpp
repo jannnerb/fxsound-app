@@ -396,6 +396,158 @@ int PT_DECLSPEC sndDevicesInitialSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, i
 }
 
 /*
+ * Exclusive-mode output.
+ *
+ * Normally FxSound writes its processed audio to the real playback device as an ordinary shared-mode stream.
+ * Windows loopback capture and per-process capture (screen sharing in Discord and similar apps) can see that
+ * stream, so a person who shares their screen gets the app's own audio and, as well, FxSound's processed copy
+ * of it, ie the audio comes out twice.
+ *
+ * A WASAPI exclusive-mode stream bypasses the Windows audio engine and its mixer, so it can't be captured that
+ * way. The functions below open the real device in exclusive mode when the device allows it. If anything about
+ * that fails the caller falls back to the original shared-mode stream, so FxSound keeps working.
+ *
+ * Exclusive mode needs a sample format that the device itself accepts, which is often integer PCM rather than the
+ * float format of the mix engine, so sndDevicesDoPlayback() converts the samples when playbackIsExclusive is set.
+ */
+static const GUID SND_DEVICES_SUBTYPE_PCM = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID SND_DEVICES_SUBTYPE_IEEE_FLOAT = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+
+/* Returns TRUE unless the user has turned exclusive-mode output off. */
+static BOOL sndDevicesExclusiveOutputWanted(PT_HANDLE *hp_sndDevices)
+{
+	wchar_t regVal[PT_MAX_GENERIC_STRLEN];
+
+	regVal[0] = 0;
+	if( sndDeviceReadFromRegistry(hp_sndDevices, REG_CURRENT_USER, SND_DEVICES_REGISTRY_EXCLUSIVE_OUTPUT, regVal) != OKAY )
+		return( SND_DEVICES_EXCLUSIVE_OUTPUT_DEFAULT != 0 );
+
+	if( wcslen(regVal) == 0 )
+		return( SND_DEVICES_EXCLUSIVE_OUTPUT_DEFAULT != 0 );
+
+	return( _wtoi(regVal) != 0 );
+}
+
+/* Builds an exclusive-mode candidate format with the same rate and channel layout as the device's mix format. */
+static void sndDevicesBuildExclusiveFormat(const WAVEFORMATEX *pMix, int sampleType, WAVEFORMATEXTENSIBLE *pOut)
+{
+	WORD containerBits = 16;
+	WORD validBits = 16;
+	BOOL isFloat = FALSE;
+	DWORD channelMask = 0;
+
+	switch( sampleType )
+	{
+		case SND_DEVICES_EXCL_FMT_FLOAT32:		containerBits = 32; validBits = 32; isFloat = TRUE; break;
+		case SND_DEVICES_EXCL_FMT_INT32:			containerBits = 32; validBits = 32; break;
+		case SND_DEVICES_EXCL_FMT_INT24_IN_32:	containerBits = 32; validBits = 24; break;
+		case SND_DEVICES_EXCL_FMT_INT24_PACKED:	containerBits = 24; validBits = 24; break;
+		default:									containerBits = 16; validBits = 16; break;
+	}
+
+	if( (pMix->wFormatTag == WAVE_FORMAT_EXTENSIBLE) && (pMix->cbSize >= 22) )
+		channelMask = ((const WAVEFORMATEXTENSIBLE *)pMix)->dwChannelMask;
+	else if( pMix->nChannels == 2 )
+		channelMask = 0x3;	// Front left and front right.
+	else if( pMix->nChannels == 1 )
+		channelMask = 0x4;	// Front center.
+
+	memset(pOut, 0, sizeof(WAVEFORMATEXTENSIBLE));
+	pOut->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+	pOut->Format.nChannels = pMix->nChannels;
+	pOut->Format.nSamplesPerSec = pMix->nSamplesPerSec;
+	pOut->Format.wBitsPerSample = containerBits;
+	pOut->Format.nBlockAlign = (WORD)(pMix->nChannels * containerBits / 8);
+	pOut->Format.nAvgBytesPerSec = pMix->nSamplesPerSec * pOut->Format.nBlockAlign;
+	pOut->Format.cbSize = 22;
+	pOut->Samples.wValidBitsPerSample = validBits;
+	pOut->dwChannelMask = channelMask;
+	pOut->SubFormat = isFloat ? SND_DEVICES_SUBTYPE_IEEE_FLOAT : SND_DEVICES_SUBTYPE_PCM;
+}
+
+/*
+ * Tries to initialize pAudioClientPlayback as an exclusive-mode, timer-driven stream, using the first sample format
+ * that the device accepts. Returns TRUE on success, with playbackIsExclusive and exclusiveSampleType set.
+ * Returns FALSE on failure, in which case pAudioClientPlayback has been released and is NULL, so the caller must
+ * activate a fresh client before trying anything else.
+ */
+static BOOL sndDevicesTryInitExclusivePlayback(struct sndDevicesHdlType *cast_handle, const WAVEFORMATEX *pMix)
+{
+	static const int candidates[] = { SND_DEVICES_EXCL_FMT_FLOAT32, SND_DEVICES_EXCL_FMT_INT32, SND_DEVICES_EXCL_FMT_INT24_IN_32,
+									  SND_DEVICES_EXCL_FMT_INT24_PACKED, SND_DEVICES_EXCL_FMT_INT16 };
+	WAVEFORMATEXTENSIBLE wfxe;
+	IAudioRenderClient *pRender = NULL;
+	BYTE *pData = NULL;
+	UINT32 frames = 0;
+	UINT32 minFramesNeeded;
+	HRESULT hr;
+	int i;
+
+	cast_handle->playbackIsExclusive = FALSE;
+
+	for( i = 0; i < (int)(sizeof(candidates) / sizeof(candidates[0])); i++ )
+	{
+		sndDevicesBuildExclusiveFormat(pMix, candidates[i], &wfxe);
+
+		// A client that failed Initialize() can't be reused, so start each attempt with a fresh one.
+		SAFE_RELEASE(cast_handle->pAudioClientPlayback);
+		hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
+		if( FAILED(hr) || (cast_handle->pAudioClientPlayback == NULL) )
+			break;
+
+		// In exclusive mode the closest-match argument must be NULL.
+		if( cast_handle->pAudioClientPlayback->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (WAVEFORMATEX *)&wfxe, NULL) != S_OK )
+			continue;
+
+		// Timer-driven (no event callback), periodicity 0 means the device default period. The session flags used for
+		// the shared-mode stream are left out, an exclusive-mode stream doesn't have an audio engine session.
+		hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, cast_handle->hnsRequestedDurationPlayback, 0, (WAVEFORMATEX *)&wfxe, NULL);
+		if( FAILED(hr) )
+		{
+			// The user has switched off exclusive mode for this device, or something else has it. Other formats won't change that.
+			if( (hr == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED) || (hr == AUDCLNT_E_DEVICE_IN_USE) )
+				break;
+			continue;
+		}
+
+		// The playback buffer has to be able to hold the first half of the capture buffer, in playback sample rate frames.
+		frames = 0;
+		minFramesNeeded = cast_handle->upsampleRatio * (cast_handle->bufferFrameSizeCapture / 2);
+		if( FAILED(cast_handle->pAudioClientPlayback->GetBufferSize(&frames)) || (frames < minFramesNeeded) )
+		{
+			SLOUT_FIRST_LINE(L"sndDevicesTryInitExclusivePlayback():: exclusive buffer too small, using shared mode");
+			break;
+		}
+
+		// The buffer of an exclusive-mode stream is the device's own buffer and what it holds before the first write
+		// is undefined. Fill it with silence, then Reset() so that the padding value goes back to zero, which is
+		// what the capture and playback loop expects at startup.
+		hr = cast_handle->pAudioClientPlayback->GetService(cast_handle->IID_IAudioRenderClient, (void**)&pRender);
+		if( SUCCEEDED(hr) && (pRender != NULL) )
+		{
+			if( SUCCEEDED(pRender->GetBuffer(frames, &pData)) )
+			{
+				if( pData != NULL )
+					memset(pData, 0, (size_t)frames * wfxe.Format.nBlockAlign);
+				pRender->ReleaseBuffer(frames, 0);
+			}
+			pRender->Release();
+			pRender = NULL;
+		}
+		cast_handle->pAudioClientPlayback->Reset();
+
+		cast_handle->exclusiveSampleType = candidates[i];
+		cast_handle->playbackIsExclusive = TRUE;
+		SLOUT_FIRST_LINE(L"sndDevicesTryInitExclusivePlayback():: playback stream is exclusive mode");
+		return( TRUE );
+	}
+
+	SAFE_RELEASE(cast_handle->pAudioClientPlayback);
+	SLOUT_FIRST_LINE(L"sndDevicesTryInitExclusivePlayback():: exclusive mode not available, using shared mode");
+	return( FALSE );
+}
+
+/*
  * FUNCTION: sndDevicesFinalSetupPlaybackDevice()
  * Does final format dependent setup of the playback device.
  */
@@ -456,35 +608,60 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 		SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_DEVICE_GET_FORMAT_FAILED);
 	}
 
-	// Query for the closest supported format before calling Initialize.
-	// Some devices (e.g. Bluetooth) return a mix format from GetMixFormat that their driver
-	// then rejects in Initialize with AUDCLNT_E_UNSUPPORTED_FORMAT.
-	WAVEFORMATEX *pClosestMatch = NULL;
+	// Try for an exclusive-mode output stream first, so that loopback and per-process capture (screen sharing) can't
+	// pick up FxSound's output a second time. If that isn't possible fall through to the normal shared-mode stream.
+	BOOL exclusiveOK = FALSE;
 
-	cast_handle->playbackDeviceIsUnavailable = FALSE;
+	cast_handle->playbackIsExclusive = FALSE;
 
-	if (cast_handle->pAudioClientPlayback->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, pwfx, &pClosestMatch) == S_FALSE && pClosestMatch != NULL)
+	if( sndDevicesExclusiveOutputWanted(hp_sndDevices) )
 	{
-		// Format is known to be unsupported — skip trying pwfx and go straight to closest match.
+		exclusiveOK = sndDevicesTryInitExclusivePlayback(cast_handle, pwfx);
+
+		if( !exclusiveOK )
+		{
+			// Start the shared-mode path from a fresh client, and a mix format taken from that client.
+			CoTaskMemFree(pwfx);
+			pwfx = NULL;
+
+			hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
+			if (FAILED(hr) || (cast_handle->pAudioClientPlayback == NULL))
+			{
+				*ip_status = SND_DEVICES_DEVICE_ACTIVATION_FAILED;
+				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_DEVICE_ACTIVATION_FAILED);
+			}
+
+			hr = cast_handle->pAudioClientPlayback->GetMixFormat(&pwfx);
+			if (FAILED(hr) || pwfx == NULL)
+			{
+				*ip_status = SND_DEVICES_DEVICE_GET_FORMAT_FAILED;
+				SND_DEVICES_SET_STATUS_AND_RETURN_OK(SND_DEVICES_DEVICE_GET_FORMAT_FAILED);
+			}
+		}
+	}
+
+	if( exclusiveOK )
+	{
+		// The exclusive-mode stream is already initialized.
+		cast_handle->playbackDeviceIsUnavailable = FALSE;
 		CoTaskMemFree(pwfx);
 		pwfx = NULL;
-		SAFE_RELEASE(cast_handle->pAudioClientPlayback);
-		hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
-		if (SUCCEEDED(hr) && cast_handle->pAudioClientPlayback != NULL)
-			hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, NULL);
-		else
-			hr = E_FAIL;
+		hr = S_OK;
 	}
 	else
 	{
-		// Format is supported (S_OK) or IsFormatSupported gave no match — try pwfx directly.
-		hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pwfx, NULL);
-		CoTaskMemFree(pwfx);
-		pwfx = NULL;
+		// Query for the closest supported format before calling Initialize.
+		// Some devices (e.g. Bluetooth) return a mix format from GetMixFormat that their driver
+		// then rejects in Initialize with AUDCLNT_E_UNSUPPORTED_FORMAT.
+		WAVEFORMATEX *pClosestMatch = NULL;
 
-		if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT && pClosestMatch != NULL)
+		cast_handle->playbackDeviceIsUnavailable = FALSE;
+
+		if (cast_handle->pAudioClientPlayback->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, pwfx, &pClosestMatch) == S_FALSE && pClosestMatch != NULL)
 		{
-			// Unexpected rejection — retry with closest match as a fallback.
+			// Format is known to be unsupported — skip trying pwfx and go straight to closest match.
+			CoTaskMemFree(pwfx);
+			pwfx = NULL;
 			SAFE_RELEASE(cast_handle->pAudioClientPlayback);
 			hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
 			if (SUCCEEDED(hr) && cast_handle->pAudioClientPlayback != NULL)
@@ -492,8 +669,26 @@ int PT_DECLSPEC sndDevicesFinalSetupPlaybackDevice(PT_HANDLE *hp_sndDevices, int
 			else
 				hr = E_FAIL;
 		}
+		else
+		{
+			// Format is supported (S_OK) or IsFormatSupported gave no match — try pwfx directly.
+			hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pwfx, NULL);
+			CoTaskMemFree(pwfx);
+			pwfx = NULL;
+
+			if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT && pClosestMatch != NULL)
+			{
+				// Unexpected rejection — retry with closest match as a fallback.
+				SAFE_RELEASE(cast_handle->pAudioClientPlayback);
+				hr = cast_handle->pPlaybackDevice->Activate(cast_handle->IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&cast_handle->pAudioClientPlayback);
+				if (SUCCEEDED(hr) && cast_handle->pAudioClientPlayback != NULL)
+					hr = cast_handle->pAudioClientPlayback->Initialize(AUDCLNT_SHAREMODE_SHARED, StreamFlags, cast_handle->hnsRequestedDurationPlayback, 0, pClosestMatch, NULL);
+				else
+					hr = E_FAIL;
+			}
+		}
+		CoTaskMemFree(pClosestMatch);
 	}
-	CoTaskMemFree(pClosestMatch);
 
 	if (FAILED(hr))
 	{

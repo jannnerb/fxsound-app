@@ -164,6 +164,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define SND_DEVICES_REGISTRY_USER_SELECTED_PLAYBACK_WIDE		L"user_selected_playback"
 #define SND_DEVICES_REGISTRY_DEFAULT_DEVICE_SELECTION_MODE	L"default_device_mode"
 #define SND_DEVICES_REGISTRY_USER_BUFFER_SIZE					L"user_buffer_size"
+#define SND_DEVICES_REGISTRY_EXCLUSIVE_OUTPUT					L"exclusive_output"
 
 /* Registry related defines, local machine */
 #define SND_DEVICES_REGISTRY_DFX_GUID								L"dfx_guid"
@@ -200,6 +201,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define SND_DEVICES_CAPTURE_BUFFER_MIN_SIZE_MILLI_SECS 10
 #define SND_DEVICES_CAPTURE_BUFFER_MAX_SIZE_MILLI_SECS 100
 #define SND_DEVICES_REFTIMES_PER_SEC 1.0e7		// A fixed reference number, used in for internal calculations
+
+/* Exclusive-mode output to the real playback device.
+ * A WASAPI exclusive-mode stream bypasses the Windows mixer, so loopback and per-process capture (screen sharing
+ * in Discord etc) can't pick up FxSound's output a second time. Set the "exclusive_output" registry value to 0
+ * to turn it off and go back to the shared-mode stream. If exclusive mode can't be used on a device, shared mode
+ * is used automatically. */
+#define SND_DEVICES_EXCLUSIVE_OUTPUT_DEFAULT	1
+
+/* Sample formats used on an exclusive-mode output stream, see exclusiveSampleType. */
+#define SND_DEVICES_EXCL_FMT_FLOAT32		0
+#define SND_DEVICES_EXCL_FMT_INT32			1
+#define SND_DEVICES_EXCL_FMT_INT24_IN_32	2	// 24 valid bits, left justified in a 32 bit container
+#define SND_DEVICES_EXCL_FMT_INT24_PACKED	3
+#define SND_DEVICES_EXCL_FMT_INT16			4
 
 // Function Status Error Macro, uses Slout module.
 // First make a w_char version of __FILE__
@@ -376,6 +391,9 @@ struct sndDevicesHdlType {
 	WAVEFORMATEX wfxPlayback;
 	WAVEFORMATEX wfxDfxProcessing;
 	WAVEFORMATEX wfxRecording;
+
+	BOOL playbackIsExclusive;		// TRUE when the stream to the real playback device is an exclusive-mode stream.
+	int exclusiveSampleType;		// One of SND_DEVICES_EXCL_FMT_*, the sample format of that exclusive-mode stream.
 
    UINT32 numCaptureFramesAvailable;
 
